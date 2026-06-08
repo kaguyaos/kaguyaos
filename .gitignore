@@ -11,3 +11,5 @@ wakamo1.jpg
 qemu.log
 .rustup
 .cargo
+.codex
+.agents
