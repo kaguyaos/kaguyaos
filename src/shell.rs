@@ -216,7 +216,7 @@ impl Shell {
     }
 
     fn eval_c(&self, src: &str) {
-        use crate::cc::cjit::compile_and_run;
+        use crate::cc::compile_and_run;
 
         match compile_and_run(src) {
             Ok(result) => {
