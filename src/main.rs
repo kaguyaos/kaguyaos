@@ -8,9 +8,8 @@ mod uefi;
 use core::ffi::c_void;
 use uefi::*;
 
-use crate::shell::shell;
 pub mod cc;
-pub mod std;
+pub mod kef;
 pub mod tinyasm;
 #[cfg(not(test))]
 #[panic_handler]
@@ -76,7 +75,6 @@ mod pci;
 mod pic;
 mod processor;
 mod scheduler;
-mod shell;
 mod syscall;
 mod writer;
 mod xhci;
@@ -300,7 +298,7 @@ pub extern "sysv64" fn kernel_main(boot_info: &BootInfo) -> ! {
     // Map heap pages
     unsafe {
         let pml4 = memory::get_table_mut(pml4_phys);
-        let flags = memory::PAGE_WRITABLE | memory::PAGE_PRESENT | memory::PAGE_USER;
+        let flags = memory::PAGE_WRITABLE | memory::PAGE_PRESENT;
         for i in 0..heap_pages as u64 {
             let addr = heap_start + i * 4096;
             memory::map_page(pml4, addr, addr, flags, &mut allocator);
@@ -313,21 +311,6 @@ pub extern "sysv64" fn kernel_main(boot_info: &BootInfo) -> ! {
 
     unsafe {
         scheduler::init();
-    }
-    let user_stack_frame = allocator
-        .allocate_frame()
-        .expect("Failed to allocate user stack");
-
-    unsafe {
-        let pml4 = memory::get_table_mut(pml4_phys);
-        let flags = memory::PAGE_WRITABLE | memory::PAGE_PRESENT | memory::PAGE_USER;
-        memory::map_page(
-            pml4,
-            user_stack_frame,
-            user_stack_frame,
-            flags,
-            &mut allocator,
-        );
     }
     if let Some(tables) = acpi_tables {
         if let Some(madt_ptr) = tables.madt {
@@ -353,10 +336,64 @@ pub extern "sysv64" fn kernel_main(boot_info: &BootInfo) -> ! {
     } else {
         println!("ACPI: tables not initialized. Cannot start APs.");
     }
-    let user_top_stack = user_stack_frame + 4096;
+
+    // Initialize FAT filesystem & load init.kef
+    let mut fs_ready = false;
+    unsafe {
+        if fs::is_ready() {
+            if fs::read_boot_sector().is_err() {
+                println!("FS: FAT volume not formatted. Formatting...");
+                if fs::format().is_ok() {
+                    fs_ready = true;
+                }
+            } else {
+                fs_ready = true;
+            }
+        }
+    }
+
+    if fs_ready {
+        let exists = fs::find_file("init.kef").ok().flatten().is_some();
+        if !exists {
+            println!("FS: init.kef not found. Assembling and creating default init.kef...");
+            let default_kef = [0]; //todo need add 
+            if let Err(e) = fs::create_file("init.kef", &default_kef) {
+                println!("FS: Failed to create init.kef: {:?}", e);
+            } else {
+                println!("FS: Successfully created init.kef");
+            }
+        }
+    }
+
+    let mut loaded = false;
+    if fs_ready {
+        match fs::read_file("init.kef") {
+            Ok(file_data) => {
+                let pml4 = unsafe { memory::get_table_mut(pml4_phys) };
+                match kef::load_kef(&file_data, &mut allocator, pml4) {
+                    Ok((entry_point, user_rsp)) => {
+                        println!("Loader: Successfully loaded init.kef. Entry={:#x}, RSP={:#x}", entry_point, user_rsp);
+                        scheduler::add_new_user_task(entry_point, user_rsp, 16384);
+                        loaded = true;
+                    }
+                    Err(e) => {
+                        println!("Loader: Failed to load init.kef: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FS: Failed to read init.kef: {:?}", e);
+            }
+        }
+    }
+
+    if !loaded {
+        panic!("Failed to load user-mode init process. System halted.");
+    }
+
     unsafe {
         let stack_base = core::ptr::addr_of!(KERNEL_STACK) as u64;
-        let stack_top = stack_base + 16384; // no & !0xF needed, already 16-byte aligned due to repr(align(16))
+        let stack_top = stack_base + 16384;
 
         // Map the kernel stack pages
         let pml4 = memory::get_table_mut(pml4_phys);
@@ -374,40 +411,12 @@ pub extern "sysv64" fn kernel_main(boot_info: &BootInfo) -> ! {
         println!("Kernel stack base={:#x} top={:#x}", stack_base, stack_top);
         println!("TSS rsp0={:#x}", gdt::get_tss_stack());
 
-        enter_usermode(user_top_stack);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "sysv64" fn user_main() {
-    shell();
-}
-
-pub unsafe fn enter_usermode(user_rsp: u64) -> ! {
-    let user_cs: u64 = gdt::USER_CODE_SEL as u64;
-    let user_ds: u64 = gdt::USER_DATA_SEL as u64;
-
-    use core::arch::asm;
-
-    // RFLAGS: Interrupts enabled (0x200) | Reserved (0x2) = 0x202
-    let rflags: u64 = 0x202;
-    let rip = user_main as *const () as u64;
-
-    unsafe {
-        asm!(
-            "push {ds}",       // SS
-            "push {rsp}",      // RSP
-            "push {rflags}",   // RFLAGS
-            "push {cs}",       // CS
-            "push {rip}",      // RIP
-            "iretq",
-            ds = in(reg) user_ds,
-            rsp = in(reg) user_rsp,
-            rflags = in(reg) rflags,
-            cs = in(reg) user_cs,
-            rip = in(reg) rip,
-            options(noreturn)
-        );
+        println!("Starting scheduler loop on BSP...");
+        core::arch::asm!("sti");
+        loop {
+            scheduler::switch_task();
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 
